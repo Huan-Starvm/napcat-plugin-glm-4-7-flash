@@ -1,0 +1,207 @@
+name: Update Plugin Index
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, for example v1.0.2. Leave empty to use package.json version."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  INDEX_REPO: NapNeko/napcat-plugin-index
+  INDEX_REPO_NAME: napcat-plugin-index
+  INDEX_BRANCH: main
+  INDEX_FILE: plugins.v4.json
+
+jobs:
+  update-index:
+    name: Create index pull request
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout plugin repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Extract plugin metadata
+        id: meta
+        shell: bash
+        run: |
+          PLUGIN_ID="$(node -p "require('./package.json').name")"
+          PLUGIN_NAME="$(node -p "require('./package.json').plugin || require('./package.json').name")"
+          DESCRIPTION="$(node -p "require('./package.json').description || ''")"
+          AUTHOR="$(node -p "require('./package.json').author || ''")"
+          TAGS="$(node -p "JSON.stringify(require('./package.json').napcat?.tags || ['工具'])")"
+          MIN_VERSION="$(node -p "require('./package.json').napcat?.minVersion || '4.14.0'")"
+          HOMEPAGE="$(node -p "require('./package.json').napcat?.homepage || require('./package.json').homepage || ''")"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.version }}" ]; then
+            TAG_NAME="${{ inputs.version }}"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            TAG_NAME="${{ github.event.release.tag_name }}"
+          else
+            TAG_NAME="v$(node -p "require('./package.json').version")"
+          fi
+
+          CLEAN_VERSION="${TAG_NAME#v}"
+          TAG_NAME="v${CLEAN_VERSION}"
+          REPO_FULL="${{ github.repository }}"
+          DOWNLOAD_URL="https://github.com/${REPO_FULL}/releases/download/${TAG_NAME}/${PLUGIN_ID}.zip"
+
+          if [ -z "${HOMEPAGE}" ]; then
+            HOMEPAGE="https://github.com/${REPO_FULL}"
+          fi
+
+          echo "plugin_id=${PLUGIN_ID}" >> "$GITHUB_OUTPUT"
+          echo "plugin_name=${PLUGIN_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${CLEAN_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "description=${DESCRIPTION}" >> "$GITHUB_OUTPUT"
+          echo "author=${AUTHOR}" >> "$GITHUB_OUTPUT"
+          echo "homepage=${HOMEPAGE}" >> "$GITHUB_OUTPUT"
+          echo "download_url=${DOWNLOAD_URL}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "min_version=${MIN_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify INDEX_PAT
+        env:
+          GH_TOKEN: ${{ secrets.INDEX_PAT }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "INDEX_PAT is missing. Add it in Settings > Secrets and variables > Actions > Repository secrets."
+            exit 1
+          fi
+
+      - name: Verify release asset exists
+        run: |
+          URL="${{ steps.meta.outputs.download_url }}"
+          echo "Checking ${URL}"
+          HTTP_CODE="$(curl -sL -o /dev/null -w "%{http_code}" "${URL}")"
+          if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 400 ]; then
+            echo "Release asset is available."
+          else
+            echo "Release asset is not available yet (HTTP ${HTTP_CODE}). Retrying in 30 seconds..."
+            sleep 30
+            HTTP_CODE="$(curl -sL -o /dev/null -w "%{http_code}" "${URL}")"
+            if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 400 ]; then
+              echo "Release asset still unavailable (HTTP ${HTTP_CODE})."
+              exit 1
+            fi
+          fi
+
+      - name: Resolve PAT user and ensure fork
+        id: fork
+        env:
+          GH_TOKEN: ${{ secrets.INDEX_PAT }}
+        shell: bash
+        run: |
+          PAT_USER="$(curl -sS -H "Authorization: token ${GH_TOKEN}" https://api.github.com/user | jq -r '.login')"
+          if [ -z "${PAT_USER}" ] || [ "${PAT_USER}" = "null" ]; then
+            echo "Unable to read GitHub user from INDEX_PAT."
+            exit 1
+          fi
+
+          FORK_REPO="${PAT_USER}/${{ env.INDEX_REPO_NAME }}"
+          echo "pat_user=${PAT_USER}" >> "$GITHUB_OUTPUT"
+          echo "fork_repo=${FORK_REPO}" >> "$GITHUB_OUTPUT"
+
+          HTTP_CODE="$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: token ${GH_TOKEN}" "https://api.github.com/repos/${FORK_REPO}")"
+          if [ "${HTTP_CODE}" = "200" ]; then
+            echo "Fork exists: ${FORK_REPO}"
+          else
+            echo "Creating fork: ${FORK_REPO}"
+            curl -sS -X POST \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ env.INDEX_REPO }}/forks" \
+              -d '{"default_branch_only": true}' | jq .
+            sleep 10
+          fi
+
+      - name: Sync fork with upstream
+        env:
+          GH_TOKEN: ${{ secrets.INDEX_PAT }}
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ steps.fork.outputs.fork_repo }}/merge-upstream" \
+            -d '{"branch": "${{ env.INDEX_BRANCH }}"}' | jq -r '.message // "Synced"'
+
+      - name: Checkout index repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INDEX_REPO }}
+          ref: ${{ env.INDEX_BRANCH }}
+          path: plugin-index
+          token: ${{ secrets.INDEX_PAT }}
+
+      - name: Update plugins.v4.json
+        env:
+          PLUGIN_ID: ${{ steps.meta.outputs.plugin_id }}
+          PLUGIN_NAME: ${{ steps.meta.outputs.plugin_name }}
+          PLUGIN_VERSION: ${{ steps.meta.outputs.version }}
+          PLUGIN_DESCRIPTION: ${{ steps.meta.outputs.description }}
+          PLUGIN_AUTHOR: ${{ steps.meta.outputs.author }}
+          PLUGIN_HOMEPAGE: ${{ steps.meta.outputs.homepage }}
+          PLUGIN_DOWNLOAD_URL: ${{ steps.meta.outputs.download_url }}
+          PLUGIN_TAGS: ${{ steps.meta.outputs.tags }}
+          PLUGIN_MIN_VERSION: ${{ steps.meta.outputs.min_version }}
+          INDEX_FILE_NAME: ${{ env.INDEX_FILE }}
+        run: |
+          cd plugin-index
+          node <<'NODE'
+          const fs = require('fs');
+          const file = process.env.INDEX_FILE_NAME;
+          const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const pluginId = process.env.PLUGIN_ID;
+          const next = {
+            id: pluginId,
+            name: process.env.PLUGIN_NAME,
+            version: process.env.PLUGIN_VERSION,
+            description: process.env.PLUGIN_DESCRIPTION,
+            author: process.env.PLUGIN_AUTHOR,
+            homepage: process.env.PLUGIN_HOMEPAGE,
+            downloadUrl: process.env.PLUGIN_DOWNLOAD_URL,
+            tags: JSON.parse(process.env.PLUGIN_TAGS),
+            minVersion: process.env.PLUGIN_MIN_VERSION
+          };
+
+          const index = data.plugins.findIndex((plugin) => plugin.id === pluginId);
+          if (index >= 0) {
+            data.plugins[index] = next;
+          } else {
+            data.plugins.push(next);
+          }
+
+          fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n');
+          NODE
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: plugin-index
+          token: ${{ secrets.INDEX_PAT }}
+          push-to-fork: ${{ steps.fork.outputs.fork_repo }}
+          commit-message: "chore: update ${{ steps.meta.outputs.plugin_id }} to v${{ steps.meta.outputs.version }}"
+          branch: "auto-update/${{ steps.meta.outputs.plugin_id }}-v${{ steps.meta.outputs.version }}"
+          delete-branch: true
+          title: "[${{ steps.meta.outputs.plugin_name }}] Update to v${{ steps.meta.outputs.version }}"
+          body: |
+            Automated plugin index update.
+
+            - Plugin ID: `${{ steps.meta.outputs.plugin_id }}`
+            - Version: `v${{ steps.meta.outputs.version }}`
+            - Download: ${{ steps.meta.outputs.download_url }}
+            - Source: ${{ steps.meta.outputs.homepage }}
