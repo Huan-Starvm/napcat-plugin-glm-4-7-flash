@@ -10,6 +10,9 @@ const DEFAULT_CONFIG = {
   targetQQ: "",
   triggerMode: "mention_or_reply",
   enablePrivateChat: false,
+  enableTemporarySessionChat: false,
+  privateChatAdminOnly: false,
+  adminQQ: "",
   stripTrigger: true,
   quoteReply: true,
   replyWithAt: false,
@@ -18,7 +21,7 @@ const DEFAULT_CONFIG = {
   temperature: 0.7,
   maxTokens: 1024,
   timeoutMs: 120000,
-  maxRetries: 2,
+  maxRetries: 3,
   retryDelayMs: 2500,
   maxReplyChars: 3500,
   resetCommand: "/重置会话",
@@ -26,6 +29,7 @@ const DEFAULT_CONFIG = {
   missingApiKeyMessage: "请先在 NapCat 插件配置里填写 GLM API Key。",
   emptyPromptMessage: "我在，请把问题和 @ 或回复一起发来。",
   timeoutMessage: "请求 GLM 超时了，请稍后再试；如果经常出现，请检查服务器网络或把请求超时调大。",
+  networkErrorMessage: "连接 GLM 接口失败，我已经自动重试过了。请检查服务器网络、DNS、代理或防火墙。",
   rateLimitMessage: "GLM-4.7-Flash 当前访问量过大，我已经自动重试过了。请稍后再试。",
   errorMessage: "GLM 暂时没有回应，请稍后再试。"
 };
@@ -87,6 +91,28 @@ export const plugin_config_ui = [
     default: DEFAULT_CONFIG.enablePrivateChat
   },
   {
+    key: "enableTemporarySessionChat",
+    type: "boolean",
+    label: "允许临时会话回复",
+    description: "开启后，群临时会话等非好友私聊也可以按私聊规则触发。",
+    default: DEFAULT_CONFIG.enableTemporarySessionChat
+  },
+  {
+    key: "privateChatAdminOnly",
+    type: "boolean",
+    label: "私聊仅回复管理员",
+    description: "开启后，私聊只响应管理员 QQ，普通用户私聊会被忽略。",
+    default: DEFAULT_CONFIG.privateChatAdminOnly
+  },
+  {
+    key: "adminQQ",
+    type: "string",
+    label: "管理员 QQ",
+    description: "多个 QQ 可用逗号、空格或换行分隔。私聊仅回复管理员开启时使用。",
+    default: DEFAULT_CONFIG.adminQQ,
+    placeholder: "例如 123456789,987654321"
+  },
+  {
     key: "stripTrigger",
     type: "boolean",
     label: "移除触发标记",
@@ -143,8 +169,8 @@ export const plugin_config_ui = [
   {
     key: "maxRetries",
     type: "number",
-    label: "失败重试次数",
-    description: "遇到 429、5xx 等临时错误时自动重试的次数。",
+    label: "最大请求次数",
+    description: "包含第一次请求。填 3 表示最多请求 3 次。",
     default: DEFAULT_CONFIG.maxRetries
   },
   {
@@ -191,6 +217,12 @@ export const plugin_config_ui = [
     type: "string",
     label: "超时提示",
     default: DEFAULT_CONFIG.timeoutMessage
+  },
+  {
+    key: "networkErrorMessage",
+    type: "string",
+    label: "网络失败提示",
+    default: DEFAULT_CONFIG.networkErrorMessage
   },
   {
     key: "rateLimitMessage",
@@ -289,6 +321,8 @@ export async function plugin_onmessage(ctx, event) {
   } catch (error) {
     if (isAbortError(error)) {
       ctx.logger.error(`GLM 请求超时，已中断。本次超时设置: ${currentConfig.timeoutMs}ms`, error);
+    } else if (isNetworkError(error)) {
+      ctx.logger.warn(`GLM 网络连接失败，已尝试 ${getMaxAttempts()} 次: ${error?.message || error}`);
     } else if (isRateLimitError(error)) {
       ctx.logger.warn(`GLM 模型繁忙或限流，状态码 ${error.status || "unknown"}，错误码 ${error.apiCode || "unknown"}`);
     } else {
@@ -297,6 +331,8 @@ export async function plugin_onmessage(ctx, event) {
 
     const message = isAbortError(error)
       ? currentConfig.timeoutMessage
+      : isNetworkError(error)
+        ? currentConfig.networkErrorMessage
       : isRateLimitError(error)
         ? currentConfig.rateLimitMessage
         : currentConfig.errorMessage;
@@ -321,6 +357,12 @@ async function getTriggerState(ctx, event, targetQQ) {
   const repliedToTarget = await isReplyToTarget(ctx, event, targetQQ);
 
   if (isPrivate) {
+    if (isTemporaryPrivateEvent(event) && !currentConfig.enableTemporarySessionChat) {
+      return { allowed: false, reason: "temporary_private_disabled" };
+    }
+    if (currentConfig.privateChatAdminOnly) {
+      return { allowed: isAdminQQ(event.user_id), reason: "private_admin_only" };
+    }
     return { allowed: currentConfig.enablePrivateChat || repliedToTarget, reason: "private" };
   }
 
@@ -332,6 +374,21 @@ async function getTriggerState(ctx, event, targetQQ) {
     return { allowed: repliedToTarget, reason: "reply" };
   }
   return { allowed: mentionedTarget || repliedToTarget, reason: "mention_or_reply" };
+}
+
+function isAdminQQ(userId) {
+  const senderQQ = String(userId || "").replace(/\D/g, "");
+  if (!senderQQ) return false;
+  return normalizeQQList(currentConfig.adminQQ).includes(senderQQ);
+}
+
+function isTemporaryPrivateEvent(event) {
+  if (event.message_type !== "private") return false;
+  if (event.group_id || event?.sender?.group_id) return true;
+
+  const subType = String(event.sub_type ?? event.subType ?? "").trim().toLowerCase();
+  if (!subType) return false;
+  return !["friend", "好友"].includes(subType);
 }
 
 function isMentioningTarget(event, targetQQ) {
@@ -446,7 +503,7 @@ async function askGLM(ctx, sessionKey, prompt, event, apiKey) {
     stream: false
   });
 
-  const maxAttempts = currentConfig.maxRetries + 1;
+  const maxAttempts = getMaxAttempts();
   let lastError;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -672,6 +729,9 @@ function normalizeConfig(input) {
       ? merged.triggerMode
       : DEFAULT_CONFIG.triggerMode,
     enablePrivateChat: booleanValue(merged.enablePrivateChat, DEFAULT_CONFIG.enablePrivateChat),
+    enableTemporarySessionChat: booleanValue(merged.enableTemporarySessionChat, DEFAULT_CONFIG.enableTemporarySessionChat),
+    privateChatAdminOnly: booleanValue(merged.privateChatAdminOnly, DEFAULT_CONFIG.privateChatAdminOnly),
+    adminQQ: normalizeQQList(merged.adminQQ).join(","),
     stripTrigger: booleanValue(merged.stripTrigger, DEFAULT_CONFIG.stripTrigger),
     quoteReply: booleanValue(merged.quoteReply, DEFAULT_CONFIG.quoteReply),
     replyWithAt: booleanValue(merged.replyWithAt, DEFAULT_CONFIG.replyWithAt),
@@ -680,7 +740,7 @@ function normalizeConfig(input) {
     temperature: numberValue(merged.temperature, DEFAULT_CONFIG.temperature, 0, 2),
     maxTokens: numberValue(merged.maxTokens, DEFAULT_CONFIG.maxTokens, 1, 8192),
     timeoutMs: numberValue(merged.timeoutMs, DEFAULT_CONFIG.timeoutMs, 5000, 600000),
-    maxRetries: numberValue(merged.maxRetries, DEFAULT_CONFIG.maxRetries, 0, 8),
+    maxRetries: Math.floor(numberValue(merged.maxRetries, DEFAULT_CONFIG.maxRetries, 1, 8)),
     retryDelayMs: numberValue(merged.retryDelayMs, DEFAULT_CONFIG.retryDelayMs, 200, 60000),
     maxReplyChars: numberValue(merged.maxReplyChars, DEFAULT_CONFIG.maxReplyChars, 500, 10000),
     resetCommand: stringValue(merged.resetCommand, DEFAULT_CONFIG.resetCommand),
@@ -688,6 +748,7 @@ function normalizeConfig(input) {
     missingApiKeyMessage: stringValue(merged.missingApiKeyMessage, DEFAULT_CONFIG.missingApiKeyMessage),
     emptyPromptMessage: stringValue(merged.emptyPromptMessage, DEFAULT_CONFIG.emptyPromptMessage),
     timeoutMessage: stringValue(merged.timeoutMessage, DEFAULT_CONFIG.timeoutMessage),
+    networkErrorMessage: stringValue(merged.networkErrorMessage, DEFAULT_CONFIG.networkErrorMessage),
     rateLimitMessage: stringValue(merged.rateLimitMessage, DEFAULT_CONFIG.rateLimitMessage),
     errorMessage: stringValue(merged.errorMessage, DEFAULT_CONFIG.errorMessage)
   };
@@ -697,6 +758,13 @@ function stringValue(value, fallback = "") {
   if (value === undefined || value === null) return fallback;
   const text = String(value);
   return text.length > 0 ? text : fallback;
+}
+
+function normalizeQQList(value) {
+  return String(value || "")
+    .split(/\D+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function numberValue(value, fallback, min, max) {
@@ -718,6 +786,16 @@ function booleanValue(value, fallback) {
 
 function isAbortError(error) {
   return error?.name === "AbortError" || /aborted/i.test(String(error?.message || ""));
+}
+
+function isNetworkError(error) {
+  const message = String(error?.message || "");
+  const causeCode = String(error?.cause?.code || "");
+  return (
+    error instanceof TypeError ||
+    /fetch failed|network|socket|connect|dns|getaddrinfo|econn|etimedout|enotfound|eai_again|tls|certificate/i.test(message) ||
+    /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR|CERT|TLS/i.test(causeCode)
+  );
 }
 
 function createGLMApiError(status, bodyText) {
@@ -744,8 +822,13 @@ function isRateLimitError(error) {
 
 function shouldRetryGLM(error, attempt, maxAttempts) {
   if (attempt >= maxAttempts) return false;
+  if (isNetworkError(error)) return true;
   const status = Number(error?.status);
   return status === 429 || status === 408 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function getMaxAttempts() {
+  return Math.max(1, Math.floor(Number(currentConfig.maxRetries) || DEFAULT_CONFIG.maxRetries));
 }
 
 function getRetryDelay(attempt) {

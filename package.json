@@ -1,7 +1,7 @@
 {
   "name": "napcat-plugin-glm-4-7-flash",
   "plugin": "GLM-4.7-Flash 聊天",
-  "version": "1.0.2",
+  "version": "1.0.5",
   "type": "module",
   "main": "index.mjs",
   "icon": "icon.png",

@@ -1,6 +1,6 @@
 # GLM-4.7-Flash NapCat 插件
 
-这是一个 NapCatQQ 插件，用于对接智谱 GLM-4.7-Flash 聊天模型。
+这是一个用于 NapCatQQ 的 GLM-4.7-Flash 聊天插件，调用智谱 BigModel OpenAI 兼容接口。
 
 ## 功能
 
@@ -8,31 +8,39 @@
 - 群聊默认只在 `@目标 QQ` 或回复 `目标 QQ` 发出的消息时触发。
 - `目标 QQ` 留空时，插件会自动读取当前登录 QQ。
 - 支持每个群成员或私聊独立的短期会话记忆。
-- 支持 429 / 5xx 临时错误自动重试。
+- 支持私聊、临时会话、管理员私聊白名单开关。
+- 支持 429、5xx、网络失败等临时错误自动重试。
 - 支持 NapCat 插件配置面板。
 
 ## 安装
 
 ```text
 plugins/
-└─ napcat-plugin-glm-4-7-flash/
-   ├─ package.json
-   ├─ index.mjs
-   ├─ icon.png
-   └─ README.md
+└── napcat-plugin-glm-4-7-flash/
+    ├── package.json
+    ├── index.mjs
+    ├── icon.png
+    └── README.md
 ```
 
 启用插件后，在配置里填写 `GLM API Key`。
 
 ## 常用配置
 
-- `GLM API Key`: 智谱 BigModel API Key，也可使用环境变量 `ZHIPUAI_API_KEY` 或 `GLM_API_KEY`。
+- `GLM API Key`: 智谱 BigModel API Key，也可以使用环境变量 `ZHIPUAI_API_KEY` 或 `GLM_API_KEY`。
 - `触发 QQ`: 群聊中被 @ 或被回复的 QQ。留空时自动使用当前登录 QQ。
 - `群聊触发方式`: 可选 `@ 或回复`、`仅 @`、`仅回复`。
-- `允许私聊直接触发`: 默认关闭。
+- `允许私聊直接触发`: 开启后，普通私聊可以直接触发。
+- `允许临时会话回复`: 开启后，群临时会话等非好友私聊也可以按私聊规则触发。
+- `私聊仅回复管理员`: 开启后，私聊只响应管理员 QQ，普通用户私聊会被忽略。
+- `管理员 QQ`: 配合 `私聊仅回复管理员` 使用，多个 QQ 可用逗号、空格或换行分隔。
 - `请求超时毫秒`: 默认 `120000`。
-- `失败重试次数`: 默认 `2`。
+- `最大请求次数`: 默认 `3`，包含第一次请求。填 `3` 表示最多请求 3 次。
 - `重试基础间隔毫秒`: 默认 `2500`。
+
+## 网络错误
+
+如果日志出现 `TypeError: fetch failed`，说明服务器到 GLM 接口的网络连接失败。插件会自动重试，仍失败时会回复“网络失败提示”。可以检查服务器 DNS、代理、防火墙，或在服务器上测试 `https://open.bigmodel.cn/api/paas/v4/chat/completions` 是否可达。
 
 ## 图标
 
