@@ -20,8 +20,11 @@ const DEFAULT_CONFIG = {
   maxHistoryRounds: 8,
   temperature: 0.7,
   maxTokens: 1024,
+  autoContinueTruncated: true,
+  maxContinuationRounds: 2,
+  continuationPrompt: "继续上一次回答，不要重复已经说过的内容，直接从中断处继续。",
   timeoutMs: 120000,
-  maxRetries: 3,
+  maxAttempts: 3,
   retryDelayMs: 2500,
   maxReplyChars: 3500,
   resetCommand: "/重置会话",
@@ -161,17 +164,31 @@ export const plugin_config_ui = [
     default: DEFAULT_CONFIG.maxTokens
   },
   {
+    key: "autoContinueTruncated",
+    type: "boolean",
+    label: "自动续写截断回复",
+    description: "模型因为输出长度限制中断时，自动继续请求并拼接后再发送。",
+    default: DEFAULT_CONFIG.autoContinueTruncated
+  },
+  {
+    key: "maxContinuationRounds",
+    type: "number",
+    label: "截断续写轮数",
+    description: "仅在自动续写截断回复开启时生效。建议 1 到 3。",
+    default: DEFAULT_CONFIG.maxContinuationRounds
+  },
+  {
     key: "timeoutMs",
     type: "number",
     label: "请求超时毫秒",
     default: DEFAULT_CONFIG.timeoutMs
   },
   {
-    key: "maxRetries",
+    key: "maxAttempts",
     type: "number",
     label: "最大请求次数",
     description: "包含第一次请求。填 3 表示最多请求 3 次。",
-    default: DEFAULT_CONFIG.maxRetries
+    default: DEFAULT_CONFIG.maxAttempts
   },
   {
     key: "retryDelayMs",
@@ -533,7 +550,29 @@ async function askGLM(ctx, sessionKey, prompt, event, apiKey) {
       }
 
       const data = JSON.parse(bodyText);
-      const answer = normalizeModelContent(data?.choices?.[0]?.message?.content).trim();
+      const choice = data?.choices?.[0] || {};
+      let answer = normalizeModelContent(choice?.message?.content);
+      let lastContent = answer;
+      let finishReason = choice?.finish_reason || choice?.finishReason || "";
+
+      for (let round = 0; currentConfig.autoContinueTruncated && isTruncatedFinishReason(finishReason) && round < getMaxContinuationRounds(); round += 1) {
+        ctx.logger.warn(`GLM 回复被长度限制截断，准备续写第 ${round + 1}/${getMaxContinuationRounds()} 轮`);
+        if (lastContent) {
+          messages.push({ role: "assistant", content: lastContent });
+        }
+        messages.push({ role: "user", content: currentConfig.continuationPrompt || DEFAULT_CONFIG.continuationPrompt });
+
+        const continuation = await fetchGLMChoice(apiKey, messages);
+        lastContent = normalizeModelContent(continuation.content);
+        if (lastContent) answer += lastContent;
+        finishReason = continuation.finishReason;
+      }
+
+      if (isTruncatedFinishReason(finishReason)) {
+        ctx.logger.warn(`GLM 回复可能仍被截断，已达到续写上限 ${getMaxContinuationRounds()} 轮`);
+      }
+
+      answer = answer.trim();
       remember(sessionKey, { role: "user", content: userContent }, { role: "assistant", content: answer });
       return answer;
     } catch (error) {
@@ -551,6 +590,43 @@ async function askGLM(ctx, sessionKey, prompt, event, apiKey) {
   }
 
   throw lastError || new Error("GLM 请求失败");
+}
+
+async function fetchGLMChoice(apiKey, messages) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), currentConfig.timeoutMs);
+
+  try {
+    const response = await fetch(buildChatCompletionsUrl(currentConfig.baseUrl), {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: currentConfig.model,
+        messages,
+        temperature: currentConfig.temperature,
+        max_tokens: currentConfig.maxTokens,
+        stream: false
+      }),
+      signal: controller.signal
+    });
+
+    const bodyText = await response.text();
+    if (!response.ok) {
+      throw createGLMApiError(response.status, bodyText);
+    }
+
+    const data = JSON.parse(bodyText);
+    const choice = data?.choices?.[0] || {};
+    return {
+      content: choice?.message?.content,
+      finishReason: choice?.finish_reason || choice?.finishReason || ""
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function remember(sessionKey, userMessage, assistantMessage) {
@@ -739,8 +815,11 @@ function normalizeConfig(input) {
     maxHistoryRounds: numberValue(merged.maxHistoryRounds, DEFAULT_CONFIG.maxHistoryRounds, 0, 50),
     temperature: numberValue(merged.temperature, DEFAULT_CONFIG.temperature, 0, 2),
     maxTokens: numberValue(merged.maxTokens, DEFAULT_CONFIG.maxTokens, 1, 8192),
+    autoContinueTruncated: booleanValue(merged.autoContinueTruncated, DEFAULT_CONFIG.autoContinueTruncated),
+    maxContinuationRounds: Math.floor(numberValue(merged.maxContinuationRounds, DEFAULT_CONFIG.maxContinuationRounds, 0, 5)),
+    continuationPrompt: stringValue(merged.continuationPrompt, DEFAULT_CONFIG.continuationPrompt),
     timeoutMs: numberValue(merged.timeoutMs, DEFAULT_CONFIG.timeoutMs, 5000, 600000),
-    maxRetries: Math.floor(numberValue(merged.maxRetries, DEFAULT_CONFIG.maxRetries, 1, 8)),
+    maxAttempts: Math.floor(numberValue(merged.maxAttempts, DEFAULT_CONFIG.maxAttempts, 1, 8)),
     retryDelayMs: numberValue(merged.retryDelayMs, DEFAULT_CONFIG.retryDelayMs, 200, 60000),
     maxReplyChars: numberValue(merged.maxReplyChars, DEFAULT_CONFIG.maxReplyChars, 500, 10000),
     resetCommand: stringValue(merged.resetCommand, DEFAULT_CONFIG.resetCommand),
@@ -828,7 +907,16 @@ function shouldRetryGLM(error, attempt, maxAttempts) {
 }
 
 function getMaxAttempts() {
-  return Math.max(1, Math.floor(Number(currentConfig.maxRetries) || DEFAULT_CONFIG.maxRetries));
+  return Math.max(1, Math.floor(Number(currentConfig.maxAttempts) || DEFAULT_CONFIG.maxAttempts));
+}
+
+function getMaxContinuationRounds() {
+  const value = Number(currentConfig.maxContinuationRounds);
+  return Math.max(0, Math.floor(Number.isFinite(value) ? value : DEFAULT_CONFIG.maxContinuationRounds));
+}
+
+function isTruncatedFinishReason(reason) {
+  return /length|max_tokens|max_output_tokens/i.test(String(reason || ""));
 }
 
 function getRetryDelay(attempt) {
