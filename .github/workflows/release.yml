@@ -62,14 +62,14 @@ jobs:
         run: |
           PLUGIN_ID="${{ steps.meta.outputs.plugin_id }}"
           rm -rf dist "${PLUGIN_ID}.zip"
-          mkdir -p "dist/${PLUGIN_ID}"
+          mkdir -p dist
 
-          cp package.json index.mjs README.md "dist/${PLUGIN_ID}/"
-          [ -f icon.png ] && cp icon.png "dist/${PLUGIN_ID}/"
-          [ -f icon.svg ] && cp icon.svg "dist/${PLUGIN_ID}/"
+          cp package.json index.mjs dist/
+          [ -f icon.png ] && cp icon.png dist/
+          [ -f icon.svg ] && cp icon.svg dist/
 
           cd dist
-          zip -r "../${PLUGIN_ID}.zip" "${PLUGIN_ID}"
+          zip -r "../${PLUGIN_ID}.zip" .
           cd ..
 
       - name: Upload artifact
