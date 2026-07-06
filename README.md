@@ -29,6 +29,8 @@ plugins/
 ## 常用配置
 
 - `GLM API Key`: 智谱 BigModel API Key，也可以使用环境变量 `ZHIPUAI_API_KEY` 或 `GLM_API_KEY`。
+- `优先使用 IPv4`: 默认开启。可解决部分 curl 正常但 Node fetch failed 的 IPv6 线路问题。
+- `记录网络错误详情`: 默认开启。fetch failed 时会记录底层 `code`、`address`、`syscall`、TLS 等信息。
 - `触发 QQ`: 群聊中被 @ 或被回复的 QQ。留空时自动使用当前登录 QQ。
 - `群聊触发方式`: 可选 `@ 或回复`、`仅 @`、`仅回复`。
 - `允许私聊直接触发`: 开启后，普通私聊可以直接触发。
@@ -45,6 +47,8 @@ plugins/
 ## 网络错误
 
 如果日志出现 `TypeError: fetch failed`，说明服务器到 GLM 接口的网络连接失败。插件会自动重试，仍失败时会回复“网络失败提示”。可以检查服务器 DNS、代理、防火墙，或在服务器上测试 `https://open.bigmodel.cn/api/paas/v4/chat/completions` 是否可达。
+
+如果 curl 可以访问但插件仍然 `fetch failed`，优先开启 `优先使用 IPv4` 和 `记录网络错误详情`，再根据日志里的 `code` 或 `cause` 判断是 IPv6、TLS、DNS 还是连接重置。
 
 ## 图标
 

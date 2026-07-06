@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import dns from "node:dns";
 
 const PLUGIN_ID = "napcat-plugin-glm-4-7-flash";
 
@@ -7,6 +8,8 @@ const DEFAULT_CONFIG = {
   apiKey: "",
   baseUrl: "https://open.bigmodel.cn/api/paas/v4",
   model: "glm-4.7-flash",
+  preferIPv4: true,
+  logNetworkErrorDetail: true,
   targetQQ: "",
   triggerMode: "mention_or_reply",
   enablePrivateChat: false,
@@ -40,6 +43,7 @@ const DEFAULT_CONFIG = {
 let currentConfig = { ...DEFAULT_CONFIG };
 let botQQ = "";
 let configFile = "";
+let currentDnsOrder = "";
 const sessions = new Map();
 const inFlight = new Set();
 
@@ -65,6 +69,20 @@ export const plugin_config_ui = [
     label: "模型",
     description: "默认对接 GLM-4.7-Flash。",
     default: DEFAULT_CONFIG.model
+  },
+  {
+    key: "preferIPv4",
+    type: "boolean",
+    label: "优先使用 IPv4",
+    description: "开启后让 Node 网络请求优先走 IPv4，可解决 curl 正常但 fetch failed 的一部分情况。",
+    default: DEFAULT_CONFIG.preferIPv4
+  },
+  {
+    key: "logNetworkErrorDetail",
+    type: "boolean",
+    label: "记录网络错误详情",
+    description: "开启后 fetch failed 会额外记录底层原因，例如 DNS、IPv6、TLS 或连接重置。",
+    default: DEFAULT_CONFIG.logNetworkErrorDetail
   },
   {
     key: "targetQQ",
@@ -260,6 +278,7 @@ export const plugin_config_schema = plugin_config_ui;
 export async function plugin_init(ctx) {
   configFile = getConfigFile(ctx);
   currentConfig = await loadConfig(ctx);
+  applyNetworkPreferences(ctx);
   botQQ = currentConfig.targetQQ || await getLoginQQ(ctx);
 
   if (!botQQ) {
@@ -278,6 +297,7 @@ export async function plugin_get_config(ctx) {
 export async function plugin_set_config(ctx, config) {
   configFile = getConfigFile(ctx);
   currentConfig = normalizeConfig(config);
+  applyNetworkPreferences(ctx);
   await saveConfig(currentConfig);
   if (currentConfig.targetQQ) {
     botQQ = currentConfig.targetQQ;
@@ -288,6 +308,7 @@ export async function plugin_set_config(ctx, config) {
 
 export async function plugin_on_config_change(ctx, _ui, _key, _value, currentConfigFromUI) {
   currentConfig = normalizeConfig(currentConfigFromUI);
+  applyNetworkPreferences(ctx);
   await saveConfig(currentConfig);
   botQQ = currentConfig.targetQQ || botQQ || await getLoginQQ(ctx);
 }
@@ -339,7 +360,7 @@ export async function plugin_onmessage(ctx, event) {
     if (isAbortError(error)) {
       ctx.logger.error(`GLM 请求超时，已中断。本次超时设置: ${currentConfig.timeoutMs}ms`, error);
     } else if (isNetworkError(error)) {
-      ctx.logger.warn(`GLM 网络连接失败，已尝试 ${getMaxAttempts()} 次: ${error?.message || error}`);
+      ctx.logger.warn(`GLM 网络连接失败，已尝试 ${getMaxAttempts()} 次: ${formatNetworkError(error)}`);
     } else if (isRateLimitError(error)) {
       ctx.logger.warn(`GLM 模型繁忙或限流，状态码 ${error.status || "unknown"}，错误码 ${error.apiCode || "unknown"}`);
     } else {
@@ -579,7 +600,7 @@ async function askGLM(ctx, sessionKey, prompt, event, apiKey) {
       if (isAbortError(error)) throw error;
       lastError = error;
       if (shouldRetryGLM(error, attempt, maxAttempts)) {
-        ctx.logger.warn(`GLM 请求失败，准备第 ${attempt + 1}/${maxAttempts} 次尝试: ${error?.message || error}`);
+        ctx.logger.warn(`GLM 请求失败，准备第 ${attempt + 1}/${maxAttempts} 次尝试: ${formatNetworkError(error)}`);
         await sleep(getRetryDelay(attempt));
         continue;
       }
@@ -741,6 +762,19 @@ async function getLoginQQ(ctx) {
   }
 }
 
+function applyNetworkPreferences(ctx) {
+  const desiredOrder = currentConfig.preferIPv4 ? "ipv4first" : "verbatim";
+  if (currentDnsOrder === desiredOrder) return;
+
+  try {
+    dns.setDefaultResultOrder(desiredOrder);
+    currentDnsOrder = desiredOrder;
+    ctx?.logger?.info?.(`GLM 网络 DNS 解析顺序已设置为 ${desiredOrder}`);
+  } catch (error) {
+    ctx?.logger?.warn?.(`设置 GLM 网络 DNS 解析顺序失败: ${formatNetworkError(error)}`);
+  }
+}
+
 async function callAction(ctx, actionName, params) {
   return ctx.actions.call(actionName, params, ctx.adapterName, ctx.pluginManager.config);
 }
@@ -800,6 +834,8 @@ function normalizeConfig(input) {
     apiKey: stringValue(merged.apiKey),
     baseUrl: stringValue(merged.baseUrl, DEFAULT_CONFIG.baseUrl),
     model: stringValue(merged.model, DEFAULT_CONFIG.model),
+    preferIPv4: booleanValue(merged.preferIPv4, DEFAULT_CONFIG.preferIPv4),
+    logNetworkErrorDetail: booleanValue(merged.logNetworkErrorDetail, DEFAULT_CONFIG.logNetworkErrorDetail),
     targetQQ: stringValue(merged.targetQQ).replace(/\D/g, ""),
     triggerMode: ["mention_or_reply", "mention", "reply"].includes(merged.triggerMode)
       ? merged.triggerMode
@@ -875,6 +911,49 @@ function isNetworkError(error) {
     /fetch failed|network|socket|connect|dns|getaddrinfo|econn|etimedout|enotfound|eai_again|tls|certificate/i.test(message) ||
     /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR|CERT|TLS/i.test(causeCode)
   );
+}
+
+function formatNetworkError(error) {
+  const simpleMessage = String(error?.message || error || "unknown error");
+  if (!currentConfig.logNetworkErrorDetail) return simpleMessage;
+
+  const parts = [];
+  appendErrorDetails(parts, error, "error");
+
+  let cause = error?.cause;
+  for (let depth = 1; cause && depth <= 4; depth += 1) {
+    appendErrorDetails(parts, cause, `cause${depth}`);
+
+    if (Array.isArray(cause.errors)) {
+      cause.errors.slice(0, 4).forEach((item, index) => {
+        appendErrorDetails(parts, item, `cause${depth}.errors${index + 1}`);
+      });
+    }
+
+    cause = cause.cause;
+  }
+
+  return parts.length > 0 ? parts.join("; ") : simpleMessage;
+}
+
+function appendErrorDetails(parts, error, label) {
+  if (!error) return;
+  const fields = [
+    ["name", error.name],
+    ["message", error.message],
+    ["code", error.code],
+    ["errno", error.errno],
+    ["syscall", error.syscall],
+    ["hostname", error.hostname],
+    ["host", error.host],
+    ["address", error.address],
+    ["port", error.port]
+  ];
+  const text = fields
+    .filter(([, value]) => value !== undefined && value !== null && String(value) !== "")
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(", ");
+  if (text) parts.push(`${label}(${text})`);
 }
 
 function createGLMApiError(status, bodyText) {
